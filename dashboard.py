@@ -17,9 +17,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings('ignore')
-
+import requests
 from dotenv import load_dotenv
-from database_pipeline import log_crm_call_interaction
 from datetime import datetime
 
 import google.generativeai as genai
@@ -80,8 +79,17 @@ def init_supabase_service() -> Client:
     except Exception:
         url = os.environ.get("SUPABASE_URL", "")
         service_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    if not url or not service_key:
-        return None
+        # 3. Crash early with a helpful explanation if strings are missing
+        if not url:
+            raise ValueError("Initialization Failed: 'SUPABASE_URL' could not be resolved from secrets or environment.")
+        if not service_key:
+            raise ValueError(
+                "Initialization Failed: 'SUPABASE_SERVICE_ROLE_KEY' could not be resolved from secrets or environment.")
+
+        try:
+            return create_client(url, service_key)
+        except Exception as init_err:
+            raise RuntimeError(f"Failed to establish Supabase client connection: {init_err}")
     return create_client(url, service_key)
 
 supabase = init_supabase()
@@ -113,6 +121,126 @@ def identify_risk_factors(input_data: dict) -> dict:
     return risk_factors if risk_factors else {"general_risk": True}
 
 
+def log_crm_call_interaction(
+    email: str, duration_sec: int, agent_name: str, direction: str,
+    owner_id: str, remark_cat: str = None,
+    outcomes_list: list = None, summary_text: str = None, interest: str = "medium",
+    followup_req: bool = False,
+    next_followup_str: str = None, priority: str = None
+    ):
+    """Resolves transactional key bindings and writes communication history logs."""
+
+
+    try:
+        # A. Resolve mandatory candidate_id (UUID) via email tracking keys
+        candidate_query = supabase_service.table("candidates").select("id").eq("email", email).limit(1).execute()
+        if not candidate_query.data:
+            raise ValueError(f"No candidate record found matching email: '{email}'")
+
+        candidate_uuid = candidate_query.data[0]["id"]
+
+        # B. Grab latest prediction reference string if available
+        prediction_uuid = None
+        pred_query = supabase_service.table("predictions").select("id").eq("email", email).order("predicted_at", desc=True).limit(1).execute()
+        if pred_query.data:
+            prediction_uuid = pred_query.data[0]["id"]
+
+        # C. Text analytics sentiment calculation
+        if summary_text:
+            joy_words = ['interested', 'excited', 'yes', 'perfect', 'join', 'good', 'agree']
+            sad_words = ['expensive', 'cancel', 'no', 'busy', 'unable', 'drop', 'bad']
+            lower_text = summary_text.lower()
+            pos = sum(1 for w in joy_words if w in lower_text)
+            neg = sum(1 for w in sad_words if w in lower_text)
+            sentiment_score = round((pos - neg) / (pos + neg), 2) if (pos + neg) > 0 else 0.0
+        else:
+            sentiment_score = 0.0
+
+        # D. Assemble call interaction configuration block
+        call_payload = {
+            "candidate_id": candidate_uuid,
+            "prediction_id": prediction_uuid,
+            "owner_id": owner_id,                    # <-- FIX: Added mapping directly here
+            "call_duration": int(duration_sec),
+            "call_agent": agent_name,                # Passes the resolved label text
+            "call_direction": direction.lower().strip(),
+            "outcomes": outcomes_list,
+            "remark_category": remark_cat if remark_cat else None,
+            "transcript_summary": summary_text,
+            "sentiment_score": float(sentiment_score),
+            "interest_level": interest.lower().strip(),
+            "followup_required": bool(followup_req),
+            "next_followup_date": next_followup_str if followup_req else None,
+            "followup_priority": priority.lower().strip() if (followup_req and priority) else None
+        }
+
+        supabase_service.table("calls").insert(call_payload).execute()
+        return True, "Success"
+
+    except ValueError as val_err:
+        print(f"Validation Error: {val_err}")
+        return False, str(val_err)
+    except Exception as db_err:
+        print(f"Call logging exception: {db_err}")
+        return False, f"Database error: {db_err}"
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+def live_groq_pipeline(text, api_key):
+    if not text.strip():
+        return None
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    allowed_outcomes = [
+        "not_interested", "unreachable", "joined_competitor",
+        "financial_issue", "already_working", "looking_for_job",
+        "decision_pending", "converted"
+    ]
+
+    prompt = f"""
+    You are an expert recruitment call analyzer. Analyze this transcript content: "{text}"
+
+    Perform the following tasks:
+    1. Translate the text into clear English if it's in Malayalam.
+    2. Write a 1-2 sentence Summary indicating if the candidate will join or not, extracting the primary reason for churn if they decline.
+    3. Categorize the overall call into exactly ONE of these allowed database outcome tags: {allowed_outcomes}
+
+    Return your output strictly in this JSON layout:
+    {{
+        "summary": "1-2 sentence final verdict summary goes here",
+        "call_outcome": "one_of_the_allowed_tags_here"
+    }}
+    """
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"You are a precise data extractor. You must output strictly in JSON format. The 'call_outcome' key MUST match one of these tokens exactly: {allowed_outcomes}."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 400
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            return json.loads(response.json()["choices"][0]["message"]["content"])
+        else:
+            st.error(f"Groq Error: {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Network Error: {str(e)}")
+        return None
 
 def parse_gemini_response(response_data):
     if not isinstance(response_data, dict):
@@ -1549,10 +1677,10 @@ def page_candidate_explorer(df, notes):
 </div>""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# PAGE 3 — Call log
+## PAGE 3 — Call log
 # ─────────────────────────────────────────────
 
-def render_agent_workspace_and_logger(supabase, owner_uuid):
+def render_agent_workspace_and_logger(supabase, active_owner_uuid):
     """
     Renders the custom styled Smart Agent Workspace with KPI matrix summary
     cards, priority followup task queues, and an integrated interaction logger.
@@ -1564,10 +1692,31 @@ def render_agent_workspace_and_logger(supabase, owner_uuid):
     </div>
     """, unsafe_allow_html=True)
 
-    # ── 1. CORE PERFORMANCE OVERVIEW MATRIX (KPI CARDS) ───────────────────
-
+    current_user_email = st.session_state.get("user_email")
+    # ── STAGE 1: FETCH THE USER ID FROM SUPABASE AUTH ────────────────
+    active_owner_uuid = None
     try:
-        rpc_stats = supabase.rpc("get_dashboard_stats", {"p_owner_id": owner_uuid}).execute()
+        # Fetch users from Supabase Auth admin panel
+        auth_response = supabase_service.auth.admin.list_users()
+
+        # The SDK returns an object where the user list is attached to `.users`
+        # or can be unpacked directly if handled as a raw data wrapper
+        users_list = getattr(auth_response, 'users', auth_response)
+
+        if users_list:
+            # Loop through the user list to find the exact email match
+            for user in users_list:
+                if hasattr(user,
+                           'email') and user.email.lower().strip() == current_user_email.lower().strip():
+                    active_owner_uuid = user.id
+                    break
+
+    except Exception as e:
+        print(f"Error querying Supabase Auth Admin table: {e}")
+
+    # ── 1. CORE PERFORMANCE OVERVIEW MATRIX (KPI CARDS) ───────────────────
+    try:
+        rpc_stats = supabase.rpc("get_dashboard_stats", {"p_owner_id": active_owner_uuid}).execute()
         if rpc_stats.data:
             s = rpc_stats.data[0]
 
@@ -1604,10 +1753,10 @@ def render_agent_workspace_and_logger(supabase, owner_uuid):
         st.warning(f"KPI compilation error: {e}")
 
     # ── 2. SMART TASK REMINDERS QUEUE ─────────────────────────────────────
-    st.markdown('<div class="section-header"><h2>📋 Prioritized Action Items (7 Days)</h2></div>',
+    st.markdown('<div class="section-header"><h2> Prioritized Action Items (7 Days)</h2></div>',
                 unsafe_allow_html=True)
     try:
-        reminders = supabase.rpc("get_followup_reminders", {"p_owner_id": owner_uuid}).execute()
+        reminders = supabase.rpc("get_followup_reminders", {"p_owner_id": active_owner_uuid}).execute()
         if reminders.data:
             df_reminders = pd.DataFrame(reminders.data)
 
@@ -1639,54 +1788,138 @@ def render_agent_workspace_and_logger(supabase, owner_uuid):
                 unsafe_allow_html=True)
 
     with st.expander("Open Communication Ingestion Terminal", expanded=True):
-        with st.form("crm_call_log_form", border=False):
+        with st.container():
             col1, col2 = st.columns(2)
             with col1:
                 c_email = st.text_input("Candidate Target Email Reference", placeholder="student@example.com")
-                direction = st.selectbox("Interaction Direction", ["Outbound", "Inbound"])
                 duration_sec = st.number_input("Call Duration Metrics (Seconds)", min_value=0, value=60, step=10)
                 interest = st.selectbox("Inferred Interest Level", ["High", "Medium", "Low"], index=1)
+
             with col2:
-                remark_cat = st.selectbox("Classification Category",
-                                          ["General Inquiry", "Batch Allocation Query", "Pricing & Scholarship Options",
-                                           "Technical Support"])
-                outcomes = st.multiselect("Interaction Outcomes",
-                                          ["Answered", "Interested", "Follow-up Scheduled", "Busy / Callback Requested",
-                                           "Not Interested"])
+                direction = st.selectbox("Interaction Direction", ["outbound", "inbound"])
+                remark_cat = st.selectbox("Call_remark",
+                                          ['positive', 'negative', 'neutral', 'follow_up_required', 'resolved', 'callback_requested', 'not_interested', 'pricing_concern', 'time_constraint', 'need_more_info'])
 
-                # Nested layout control settings
-                f_req = st.checkbox("Toggle Future Outreach Flag?", value=False)
-                f_date = st.date_input("Outreach Followup Window Target", min_value=datetime.today())
-                f_pri = st.selectbox("Task Escalation Priority", ["low", "medium", "high", "urgent"], index=1)
+            st.markdown('<div style="margin-top: 15px; margin-bottom: 5px; font-size:14px; font-weight:600; color:#cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 5px;"><i class="fa-solid fa-calendar-check" style="margin-right:8px; color:#38bdf8;"></i> Follow-up Action Plan</div>', unsafe_allow_html=True)
+            f_req = st.toggle("Enable Future Follow-up", value=False)
+            
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                f_date = st.date_input("Next Followup Date", min_value=datetime.today(), disabled=not f_req)
+            with col_f2:
+                f_pri = st.selectbox("Followup Priority", ["low", "medium", "high", "urgent"], index=1, disabled=not f_req)
 
-            transcript_text = st.text_area("Full Audio Transcript Transcription Matrix / Core Logging Strings",
-                                           placeholder="Paste conversation transcript block details here...")
-            remarks_text = st.text_area("Executive Summary Notes", placeholder="Provide high-level takeaways...")
+            if "current_summary" not in st.session_state:
+                st.session_state["current_summary"] = ""
+            # This will quietly hold onto the Enum string behind the scenes
+            if "hidden_outcome" not in st.session_state:
+                st.session_state["hidden_outcome"] = ""
+            if "previous_text" not in st.session_state:
+                st.session_state["previous_text"] = ""
+
+            # 1. User inputs transcript
+            transcript_text = st.text_area(
+                "Full Audio Call Transcription",
+                placeholder="Paste conversation transcription details here...",
+                height=200
+            )
+
+            # Watch for Paste Event (Auto-generates summary and outcome)
+            if transcript_text.strip() and transcript_text != st.session_state["previous_text"]:
+                if not GROQ_API_KEY:
+                    st.error("Missing GROQ_API_KEY in your local .env configuration.")
+                else:
+                    with st.spinner("Processing Malayalam text..."):
+                        result = live_groq_pipeline(transcript_text, GROQ_API_KEY)
+                        if result:
+                            st.session_state["current_summary"] = result.get("summary", "")
+                            st.session_state["hidden_outcome"] = result.get("call_outcome", "")
+                            st.session_state["previous_text"] = transcript_text
+                            st.rerun()
+
+            # Reset state if text box is cleared
+            if not transcript_text.strip() and st.session_state["current_summary"]:
+                st.session_state["current_summary"] = ""
+                st.session_state["hidden_outcome"] = ""
+                st.session_state["previous_text"] = ""
+                st.rerun()
+
+            # 2. Display Generated Summary (The user can read/edit this if necessary)
+            remarks_text = st.text_area(
+                "Transcription Summary",
+                value=st.session_state["current_summary"],
+                placeholder="Summary will auto-generate here...",
+                height=100
+            )
+
 
             st.markdown("<div style='margin-top: 12px;'></div>", unsafe_allow_html=True)
-            if st.form_submit_button("Commit Log Ingestion", type="primary", use_container_width=True):
+            if st.button("Commit Log Ingestion", type="primary", use_container_width=True):
                 if not c_email:
                     st.error("Please specify a target email identity mapping reference.")
                 else:
                     f_date_str = f_date.strftime("%Y-%m-%d") if f_req else None
-                    success = log_crm_call_interaction(
-                        email=c_email.strip(), duration_sec=int(duration_sec), agent_name="Dashboard Agent",
-                        direction=direction,
-                        transcript_text=transcript_text, remarks_text=remarks_text, remark_cat=remark_cat,
-                        outcomes_list=outcomes,
-                        summary_text=remarks_text[:200] if remarks_text else "No summary provided.", interest=interest,
-                        followup_req=f_req,
-                        next_followup_str=f_date_str, priority=f_pri
-                    )
-                    if success:
-                        st.success("Interaction touchpoint committed directly to transactional registries.")
-                        st.rerun()
+
+                    # ── STAGE 1: FETCH THE USER ID FROM SUPABASE AUTH ────────────────
+                    active_owner_uuid = None
+                    try:
+                        # Fetch users from Supabase Auth admin panel
+                        auth_response = supabase_service.auth.admin.list_users()
+
+                        # The SDK returns an object where the user list is attached to `.users`
+                        # or can be unpacked directly if handled as a raw data wrapper
+                        users_list = getattr(auth_response, 'users', auth_response)
+
+                        if users_list:
+                            # Loop through the user list to find the exact email match
+                            for user in users_list:
+                                if hasattr(user,
+                                           'email') and user.email.lower().strip() == current_user_email.lower().strip():
+                                    active_owner_uuid = user.id
+                                    break
+
+                    except Exception as e:
+                        print(f"Error querying Supabase Auth Admin table: {e}")
+
+                    # ── STAGE 2: FETCH THE LEGACY LABEL FROM SALESPERSON MAPPING ─────
+                    legacy_agent_label = "Unknown Agent"
+                    try:
+                        agent_query = supabase.table("salesperson_mappings") \
+                            .select("legacy_label") \
+                            .eq("salesperson_email", current_user_email.strip()) \
+                            .limit(1).execute()
+
+                        if agent_query.data and agent_query.data[0].get("legacy_label"):
+                            legacy_agent_label = agent_query.data[0]["legacy_label"]
+                    except Exception as e:
+                        print(f"Error looking up legacy mapping table: {e}")
+
+                    # ── STAGE 3: VALIDATION AND EXECUTION ────────────────────────────
+                    if not active_owner_uuid:
+                        st.error(
+                            f" Ingestion Blocked: Found your session email ('{current_user_email}'), but it does not map to any registered account in Supabase Auth.")
                     else:
-                        st.error("Transaction Aborted: Target student identifier matrix mapping not found.")
+                        # Execute log insertion using the freshly resolved UUID
+                        success, message = log_crm_call_interaction(
+                            email=c_email.strip(),
+                            duration_sec=int(duration_sec),
+                            agent_name=legacy_agent_label,
+                            owner_id=active_owner_uuid,  # <-- Pass the real Auth UUID here!
+                            direction=direction,
+                            outcomes_list=[st.session_state["hidden_outcome"]],
+                            remark_cat=remark_cat,
+                            summary_text=remarks_text[:200] if remarks_text else "No summary provided.",
+                            interest=interest,
+                            followup_req=f_req,
+                            next_followup_str=f_date_str,
+                            priority=f_pri
+                        )
 
-
-
-#
+                        if success:
+                            st.success("Interaction touchpoint committed directly to transactional registries.")
+                            st.rerun()
+                        else:
+                            st.error(f"Transaction Aborted: {message}")
 
 def render_candidate_entry_form(df, notes):
     # ── Identical Page Header Layout ─────────────────────────────
@@ -1803,14 +2036,17 @@ def render_candidate_entry_form(df, notes):
         default_total_fee = st.session_state.candidate_form_data.get('default_total_fee', 0.0)
 
         st.markdown('<div style="font-size:15px; font-weight:700; color:#38bdf8; margin: 25px 0 10px 0; text-transform:uppercase; letter-spacing:0.5px;"><i class="fa-solid fa-graduation-cap" style="margin-right:8px;"></i> Course & Track Configuration</div>', unsafe_allow_html=True)
+        st.info(f"Selected Course: **{course}**")
         col_course1, col_course2 = st.columns(2)
         with col_course1:
-            st.info(f"Selected Course: **{course}**")
             stream = st.selectbox("Interested Stream *", stream_opts, index=get_index(stream_opts, st.session_state.candidate_form_data.get('stream')))
             track_interested = st.selectbox("Track Customization *", track_opts, index=get_index(track_opts, st.session_state.candidate_form_data.get('track_interested')))
         with col_course2:
             program_mode = st.selectbox("Mode of Program Joined *", mode_opts, index=get_index(mode_opts, st.session_state.candidate_form_data.get('program_mode')))
             program_location = st.selectbox("Program Location *", loc_opts, index=get_index(loc_opts, st.session_state.candidate_form_data.get('program_location')))
+            
+        col_batch1, col_batch2 = st.columns(2)
+        with col_batch1:
             batch_assigned = st.text_input("Batch Assigned *", value=st.session_state.candidate_form_data.get('batch_assigned', ""), placeholder="Aug 2026")
 
         st.markdown('<div style="font-size:15px; font-weight:700; color:#38bdf8; margin: 25px 0 10px 0; text-transform:uppercase; letter-spacing:0.5px;"><i class="fa-solid fa-location-dot" style="margin-right:8px;"></i> Regional Details</div>', unsafe_allow_html=True)
