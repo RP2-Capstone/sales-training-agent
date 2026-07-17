@@ -323,7 +323,7 @@ def build_gemini_prompt(candidate_info, remarks_text, feedback_text, transcript_
     prompt = (
             "You are an expert AI candidate churn analyst for an IT professional training academy.\n"
             "Your task is to analyze candidate profile details and communication logs context to formulate a concise, logical, and personalized churn reason explanation alongside actionable recommendations.\n"
-            "Value of the 'reason' key in the output JSON MUST be a comprehensive, detailed sentence or maximum three sentences explaining specifically why this candidate is churning, incorporating facts from their profile, payment details, and remarks.\n"
+            "Value of the 'reason' key in the output JSON MUST be a comprehensive, brief sentence or maximum three sentences explaining specifically why this candidate is churning, incorporating facts from their profile, payment details, transcript, remarks, may bold the main reason for churning.\n"
             "Value of the 'recommendation' key should be a highly logical, customized recovery plan based on their situation.\n\n"
             "Strict Format Constraint:\n"
             "You MUST respond ONLY with a clean JSON object containing exactly two keys: 'reason' and 'recommendation'. Do not include any standard prefixes, Markdown formatting blocks like ```json, or other notes. It must be clean, parsable JSON text.\n\n"
@@ -912,7 +912,7 @@ def load_data():
 
     # ── Layer 1: Attempt Absolute Admin Supabase Pull ──
     try:
-        # 🌟 FORCE BEYOND RLS: Explicitly use the admin service-role key client.
+
         # If your keys are bound to 'supabase_service', use it directly to ignore security walls.
         if supabase_service is not None:
             read_client = supabase_service
@@ -1021,7 +1021,7 @@ def preprocess(df, notes):
     df['Course'] = df['Course'].fillna('Unknown')
     df['Invoice'] = df['Invoice'].fillna('No')
 
-    # ── 🌟 TROUBLESHOOTING FIX: RENAME, TYPECAST & FILL NULL VALUES ──
+
     df['final_inferred_reason'] = df['final_inferred_reason'].fillna('N/A')
         # 2. Rename directly to 'final_inferred_reason' for your charts/analysis pages
     #df = df.rename(columns={'background_override': 'final_inferred_reason'})
@@ -1235,7 +1235,7 @@ def page_auth():
                             st.session_state.logged_in = True
                             st.session_state.user_email = res.user.email
 
-                            # 🌟 Extract role from user metadata (defaults to Salesperson if not defined)
+                            #  Extract role from user metadata (defaults to Salesperson if not defined)
                             user_metadata = res.user.user_metadata if res.user.user_metadata else {}
                             st.session_state.user_role = user_metadata.get("role", "Salesperson")
 
@@ -1267,7 +1267,7 @@ def page_auth():
                 reg_email = st.text_input("Email Address", key="reg_email")
                 reg_password = st.text_input("Password", type="password", key="reg_password")
 
-                # 🌟 Added Role selection drop-down directly into Registration Form
+
                 reg_role = st.selectbox("Select Account Tier", ["Salesperson", "Admin"], index=0, key="reg_role")
 
                 st.markdown("<div style='margin-top: 16px;'></div>", unsafe_allow_html=True)
@@ -1275,7 +1275,7 @@ def page_auth():
                 if submitted_reg:
                     if reg_email and reg_password:
                         try:
-                            # 🌟 Pass the selected role metadata directly into Supabase User Sign Up configuration
+                            #  Pass the selected role metadata directly into Supabase User Sign Up configuration
                             res = supabase.auth.sign_up({
                                 "email": reg_email,
                                 "password": reg_password,
@@ -1321,19 +1321,19 @@ def sidebar():
             </div>
             """, unsafe_allow_html=True)
 
-        # 🌟 Define access configurations depending on assigned roles
+
         user_role = st.session_state.get("user_role", "Salesperson")
 
         if user_role == "Admin":
             pages = [
                 ("Overview", ":material/dashboard:"),
                 ("Candidate Explorer", ":material/search:"),
-                ("Salesperson Analytics", ":material/analytics:"),  # 🌟 ADDED THIS
-                ("Smart Agent Workspace", ":material/assignment_turned_in:"),
-                ("Add New Candidate", ":material/person_add:"),
+                ("Salesperson Analytics", ":material/analytics:"),
                 ("CRM Notes Analysis", ":material/call:"),
                 ("Invoice Analysis", ":material/payments:"),
                 ("Live Predictor", ":material/online_prediction:"),
+                ("Add New Candidate", ":material/person_add:"),
+                ("Agents Workspace", ":material/assignment_turned_in:"),
                 ("Model Performance", ":material/insights:")
             ]
         else:
@@ -1354,7 +1354,7 @@ def sidebar():
                 st.session_state.show_profile = False
                 st.rerun()
 
-        # 🌟 DYNAMICALLY HIGHLIGHT BUTTON BASED ON VISIBLE INDEX POSITION
+
         active_idx = [p[0] for p in pages].index(st.session_state.current_page) + 2
         st.markdown(f"""
         <style>
@@ -2984,8 +2984,17 @@ def page_live_predictor(df, model_data, supabase):
         call_transcript = st.text_area("Call Transcript (optional)", value=pd_state.get('call_transcript', ""),
                                        max_chars=2000, placeholder="Paste full call transcript...")
         call_remarks = ""
-        st.markdown("<br>", unsafe_allow_html=True)
 
+        st.markdown(
+            '<div style="font-size:15px; font-weight:700; color:#38bdf8; margin: 25px 0 10px 0; text-transform:uppercase; letter-spacing:0.5px;"><i class="fa-solid fa-microchip" style="margin-right:8px;"></i> AI Extraction Engine</div>',
+            unsafe_allow_html=True)
+        preferred_ai = st.selectbox(
+            "Select AI Model for Reason & Recommendation Extraction",
+            ["Auto (Fallback)", "Gemini", "Groq", "Hugging Face"],
+            help="Choose the underlying AI engine to analyze call transcripts and remarks. 'Auto (Fallback)' tries Gemini first, then Groq, then Hugging Face."
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
         c1, c2, c3 = st.columns([1, 2, 2])
         with c1:
             if st.button("Back", icon=":material/arrow_back:", use_container_width=True):
@@ -3045,6 +3054,18 @@ def page_live_predictor(df, model_data, supabase):
                 'Stream': stream, 'Induction session': induction_session, 'Feedback': feedback,
                 'Payment_mode': payment_mode, 'email': c_email
             }
+            model_df_input = input_data.copy()
+            model_df_input['role'] = "professional" if experience > 0 else "student"
+            model_df_input['background'] = "tech" if "tech" in str(education).lower() else "non tech"
+
+            # Map the checkboxes directly to the numerical 1/0 vectors expected by X
+            model_df_input['not_interested'] = int(not_interested)
+            model_df_input['joined_competitor'] = int(joined_competitor)
+            model_df_input['decision_pending'] = int(decision_pending)
+            model_df_input['already_working'] = int(already_working)
+            model_df_input['looking_for_job'] = int(looking_for_job)
+            model_df_input['financial_issue'] = int(financial_issue)
+            model_df_input['join_later'] = int(join_later)
 
             if not is_llm:
                 model_df_input = input_data.copy()
@@ -3194,8 +3215,34 @@ def page_live_predictor(df, model_data, supabase):
                     ret_prate = float(db_metrics.get('paid_rate') or derived_paid_rate) * 100
 
                     action_req = '<i class="fa-solid fa-triangle-exclamation" style="color:#fbbf24"></i> <b style="color:#fbbf24;">Action Required:</b> Immediate intervention.' if pred == 1 else '<i class="fa-solid fa-circle-check" style="color:#34d399"></i> <b style="color:#34d399;">On Track:</b> Monitor.'
+                    suggested_reason, ai_recommendation, extraction_method = extract_reason_and_recommendation(
+                        model_df_input,
+                        call_remarks,
+                        feedback,
+                        call_transcript,
+                        preferred_ai=preferred_ai
+                    )
 
-                    st.markdown(f"""<div class="candidate-card" style="margin-top:0; height:100%; display:flex; flex-direction:column;">
+                    def format_ai_output(obj):
+                        if isinstance(obj, str):
+                            obj_s = obj.strip()
+                            if (obj_s.startswith('{') and obj_s.endswith('}')) or (
+                                    obj_s.startswith('[') and obj_s.endswith(']')):
+                                import ast
+                                try:
+                                    obj = ast.literal_eval(obj_s)
+                                except Exception:
+                                    pass
+                        if isinstance(obj, dict):
+                            return "\n\n".join([f"**{k}:** {v}" for k, v in obj.items()])
+                        elif isinstance(obj, list):
+                            return "\n\n".join([f"- {v}" for v in obj])
+                        return str(obj)
+
+                    if suggested_reason and str(suggested_reason).lower() not in ['unknown', 'none', 'nan', '']:
+                          reason_html = markdown.markdown(format_ai_output(suggested_reason))
+                          rec_html = markdown.markdown(format_ai_output(ai_recommendation))
+                          st.markdown(f"""<div class="candidate-card" style="margin-top:0; height:100%; display:flex; flex-direction:column;">
                                 <div style="font-size:13px; font-weight:700; color:#38bdf8; margin-bottom:5px; text-transform:uppercase;">Database Generated Outputs</div>
                                 <div style="font-size:12px; color:#cbd5e1; margin-bottom:10px; line-height:1.4;">
                                 • Computed Role Category: <b style="color:#a78bfa;">{ret_role}</b><br>
@@ -3205,11 +3252,11 @@ def page_live_predictor(df, model_data, supabase):
                                 <hr style="border-color:rgba(255,255,255,0.1); margin:4px 0;">
                                 <div style="font-size:12px; color:#e2e8f0; margin-bottom:8px;">
                                 <span style="color:#64748b; font-weight:600;">Reasoning:</span><br>
-                                <i>"{llm_reason}"</i>
+                                <i>"{reason_html}"</i>
                                 </div>
                                 <div style="font-size:12px; color:#38bdf8; margin-bottom:10px; flex-grow:1;">
                                 <span style="color:#64748b; font-weight:600;">Retention Strategy:</span><br>
-                                <b>{llm_retention}</b>
+                                <b>{rec_html}</b>
                                 </div>
                                 <hr style="border-color:rgba(255,255,255,0.1); margin:4px 0;">
                                 <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -3819,9 +3866,9 @@ def main():
         page_overview(df, notes)
     elif page == "Candidate Explorer" and user_role == "Admin":
         page_candidate_explorer(df, notes)
-    elif page == "Salesperson Analytics" and user_role == "Admin":  # 🌟 ADDED THIS ROUTE
+    elif page == "Salesperson Analytics" and user_role == "Admin":
         page_salesperson_stats(df, supabase)
-    elif page == "Smart Agent Workspace":
+    elif page == "Agents Workspace":
         render_agent_workspace_and_logger(supabase, logged_in_user_uuid)
     elif page == "Add New Candidate":
         render_candidate_entry_form(df, notes)
